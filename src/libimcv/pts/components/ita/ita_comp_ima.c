@@ -29,7 +29,6 @@
 #define SECURITY_DIR				"/sys/kernel/security/"
 #define IMA_BIOS_MEASUREMENTS		SECURITY_DIR "tpm0/binary_bios_measurements"
 #define IMA_RUNTIME_MEASUREMENTS	SECURITY_DIR "ima/binary_runtime_measurements"
-#define IMA_FILENAME_LEN_MAX		255
 
 typedef struct pts_ita_comp_ima_t pts_ita_comp_ima_t;
 typedef enum ima_state_t ima_state_t;
@@ -119,6 +118,11 @@ struct pts_ita_comp_ima_t {
 	bool pcr_info;
 
 	/**
+	 * Whether to pad PCR measurements if matching hash is not available
+	 */
+	bool pcr_padding;
+
+	/**
 	 * Creation time of measurement
 	 */
 	time_t creation_time;
@@ -165,16 +169,15 @@ struct pts_ita_comp_ima_t {
  */
 static pts_comp_evidence_t* extend_pcr(pts_ita_comp_ima_t* this,
 									   uint8_t qualifier, pts_pcr_t *pcrs,
-									   uint32_t pcr, chunk_t measurement)
+									   uint32_t pcr, chunk_t measurement,
+									   pts_pcr_transform_t pcr_transform)
 {
-	pts_pcr_transform_t pcr_transform;
 	pts_meas_algorithms_t pcr_algo;
 	pts_comp_func_name_t *name;
 	pts_comp_evidence_t *evidence;
 	chunk_t pcr_before = chunk_empty, pcr_after = chunk_empty;
 
 	pcr_algo = pcrs->get_pcr_algo(pcrs);
-	pcr_transform = PTS_PCR_TRANSFORM_MATCH;
 
 	if (this->pcr_info)
 	{
@@ -199,24 +202,31 @@ static pts_comp_evidence_t* extend_pcr(pts_ita_comp_ima_t* this,
 }
 
 /**
- * Generate an IMA or IMA-NG hash from an event digest and event name
- *
- * @param digest		event digest
- * @param ima_algo		hash algorithm string ("sha1:", "sha256:", etc.)
- * @param ima_name		event name
- * @param little_endian	endianness of client platform
- * @param algo			hash algorithm used by TPM
- * @param hash_buf		hash value to be compared with TPM measurement
+ * Compute and check boot aggregate value by hashing PCR0 to PCR7
  */
-static bool ima_hash(chunk_t digest, char *ima_algo, char *ima_name,
-					 bool little_endian, pts_meas_algorithms_t algo,
-					 char *hash_buf)
+static bool check_boot_aggregate(pts_pcr_t *pcrs, chunk_t measurement,
+								 char *algo, bool pcr_padding)
 {
+	chunk_t boot_aggregate, ba_measurement;
+	uint8_t pcr_buffer[HASH_SIZE_SHA512];
+	uint8_t meas_buffer[HASH_SIZE_SHA512];
+	size_t hash_size;
+	pts_meas_algorithms_t pcr_algo;
 	hash_algorithm_t hash_alg;
 	hasher_t *hasher;
-	bool success;
+	uint32_t i;
+	bool success, pcr_ok = TRUE;
 
-	hash_alg = pts_meas_algo_to_hash(algo);
+	/* determine PCR hash algorithm and the need for PCR padding */
+	pcr_algo = pcrs->get_pcr_algo(pcrs);
+	if (pcr_algo == PTS_MEAS_ALGO_SHA1)
+	{
+		pcr_padding = FALSE;
+	}
+
+
+	/* create hasher for boot aggregate computation */
+	hash_alg = pts_meas_algo_to_hash(pcr_algo);
 	hasher = lib->crypto->create_hasher(lib->crypto, hash_alg);
 	if (!hasher)
 	{
@@ -224,67 +234,10 @@ static bool ima_hash(chunk_t digest, char *ima_algo, char *ima_name,
 			 hash_algorithm_short_names, hash_alg);
 		return FALSE;
 	}
+	hash_size = hasher->get_hash_size(hasher);
 
-	if (ima_algo)
-	{
-		uint32_t d_len, n_len;
-		chunk_t algo_name, event_name, digest_len, name_len;
 
-		/* IMA-NG hash */
-		algo_name  = chunk_create(ima_algo, strlen(ima_algo) + 1);
-		event_name = chunk_create(ima_name, strlen(ima_name) + 1);
-
-		d_len = algo_name.len + digest.len;
-		digest_len = chunk_create((uint8_t*)&d_len, sizeof(d_len));
-		/* TODO handle endianness of both client and server platforms */
-
-		n_len = event_name.len;
-		name_len = chunk_create((uint8_t*)&n_len, sizeof(n_len));
-		/* TODO handle endianness of both client and server platforms */
-
-		success = hasher->get_hash(hasher, digest_len, NULL) &&
-				  hasher->get_hash(hasher, algo_name, NULL) &&
-				  hasher->get_hash(hasher, digest, NULL) &&
-				  hasher->get_hash(hasher, name_len, NULL) &&
-				  hasher->get_hash(hasher, event_name, hash_buf);
-	}
-	else
-	{
-		u_char filename_buffer[IMA_FILENAME_LEN_MAX + 1];
-		chunk_t file_name;
-
-		/* IMA legacy hash */
-		memset(filename_buffer, 0, sizeof(filename_buffer));
-		strncpy(filename_buffer, ima_name, IMA_FILENAME_LEN_MAX);
-		file_name = chunk_create (filename_buffer, sizeof(filename_buffer));
-
-		success = hasher->get_hash(hasher, digest, NULL) &&
-				  hasher->get_hash(hasher, file_name, hash_buf);
-	}
-	hasher->destroy(hasher);
-
-	return success;
-}
-
-/**
- * Compute and check boot aggregate value by hashing PCR0 to PCR7
- */
-static bool check_boot_aggregate(pts_pcr_t *pcrs, chunk_t measurement,
-								 char *algo)
-{
-	u_char pcr_buffer[HASH_SIZE_SHA1];
-	chunk_t boot_aggregate;
-	hasher_t *hasher;
-	uint32_t i;
-	bool success, pcr_ok = TRUE;
-
-	hasher = lib->crypto->create_hasher(lib->crypto, HASH_SHA1);
-	if (!hasher)
-	{
-		DBG1(DBG_PTS, "%N hasher could not be created",
-			 hash_algorithm_short_names, HASH_SHA1);
-		return FALSE;
-	}
+	/* the boot aggregate hash is computed over PCR0 .. PCR7 */
 	for (i = 0; i < 8 && pcr_ok; i++)
 	{
 		pcr_ok = hasher->get_hash(hasher, pcrs->get(pcrs, i), NULL);
@@ -292,20 +245,25 @@ static bool check_boot_aggregate(pts_pcr_t *pcrs, chunk_t measurement,
 	if (pcr_ok)
 	{
 		pcr_ok = hasher->get_hash(hasher, chunk_empty, pcr_buffer);
+		boot_aggregate = chunk_create(pcr_buffer,  hash_size);
 	}
 	hasher->destroy(hasher);
 
+
 	if (pcr_ok)
 	{
-		boot_aggregate = chunk_create(pcr_buffer, sizeof(pcr_buffer));
-
-		/* TODO handle endianness of client platform */
-		pcr_ok = ima_hash(boot_aggregate, algo, "boot_aggregate",
-						  TRUE, PTS_MEAS_ALGO_SHA1, pcr_buffer);
+		ba_measurement = chunk_create(meas_buffer, hash_size);
+		if (pcr_padding)
+		{
+			memset(meas_buffer, 0x00, hash_size);
+			pcr_algo = PTS_MEAS_ALGO_SHA1;
+		}
+		pcr_ok = pts_ima_event_hash(boot_aggregate, algo, "boot_aggregate",
+									pcr_algo, meas_buffer);
 	}
 	if (pcr_ok)
 	{
-		success = chunk_equals_const(boot_aggregate, measurement);
+		success = chunk_equals_const(ba_measurement, measurement);
 		DBG1(DBG_PTS, "boot aggregate value is %scorrect",
 					   success ? "":"in");
 		return success;
@@ -340,6 +298,7 @@ METHOD(pts_component_t, measure, status_t,
 	pts_comp_evidence_t **evidence)
 {
 	pts_pcr_t *pcrs;
+	pts_meas_algorithms_t pcr_algo;
 	pts_comp_evidence_t *evid = NULL;
 	size_t algo_len, name_len;
 	chunk_t measurement;
@@ -352,6 +311,7 @@ METHOD(pts_component_t, measure, status_t,
 	{
 		return FAILED;
 	}
+	pcr_algo = pcrs->get_pcr_algo(pcrs);
 
 	if (qualifier == (PTS_ITA_QUALIFIER_FLAG_KERNEL |
 					  PTS_ITA_QUALIFIER_TYPE_TRUSTED))
@@ -360,8 +320,7 @@ METHOD(pts_component_t, measure, status_t,
 		{
 			case IMA_STATE_INIT:
 				this->bios_list = pts_ima_bios_list_create(pts->get_tpm(pts),
-													IMA_BIOS_MEASUREMENTS,
-									 				pcrs->get_pcr_algo(pcrs));
+											IMA_BIOS_MEASUREMENTS, pcr_algo);
 				if (!this->bios_list)
 				{
 					return FAILED;
@@ -378,7 +337,8 @@ METHOD(pts_component_t, measure, status_t,
 					DBG1(DBG_PTS, "could not retrieve bios measurement entry");
 					return status;
 				}
-				evid = extend_pcr(this, qualifier, pcrs, pcr, measurement);
+				evid = extend_pcr(this, qualifier, pcrs, pcr, measurement,
+										PTS_PCR_TRANSFORM_MATCH);
 
 				this->state = this->bios_list->get_count(this->bios_list) ?
 										IMA_STATE_BIOS : IMA_STATE_INIT;
@@ -393,8 +353,16 @@ METHOD(pts_component_t, measure, status_t,
 		switch (this->state)
 		{
 			case IMA_STATE_INIT:
+
+				/* disable padding for SHA1 legacy hash */
+				if (pcr_algo == PTS_MEAS_ALGO_SHA1)
+				{
+					this->pcr_padding = FALSE;
+				}
+
 				this->ima_list = pts_ima_event_list_create(
-												IMA_RUNTIME_MEASUREMENTS);
+										IMA_RUNTIME_MEASUREMENTS,
+										pcr_algo, this->pcr_padding);
 				if (!this->ima_list)
 				{
 					return FAILED;
@@ -414,13 +382,16 @@ METHOD(pts_component_t, measure, status_t,
 				}
 				if (this->state == IMA_STATE_BOOT_AGGREGATE && this->bios_count)
 				{
-					if (!check_boot_aggregate(pcrs, measurement, algo))
+					if (!check_boot_aggregate(pcrs, measurement, algo,
+											  this->pcr_padding))
 					{
 						return FAILED;
 					}
 				}
-				evid = extend_pcr(this, qualifier, pcrs, IMA_PCR,
-								  measurement);
+
+				evid = extend_pcr(this, qualifier, pcrs, IMA_PCR, measurement,
+								  this->pcr_padding ? PTS_PCR_TRANSFORM_SHORT :
+													  PTS_PCR_TRANSFORM_MATCH);
 				if (evid)
 				{
 					if (algo)
@@ -528,7 +499,7 @@ METHOD(pts_component_t, verify, status_t,
 {
 	bool has_pcr_info;
 	uint32_t pcr;
-	pts_meas_algorithms_t algo;
+	pts_meas_algorithms_t algo, pcr_algo;
 	pts_pcr_transform_t transform;
 	pts_pcr_t *pcrs;
 	time_t creation_time;
@@ -536,13 +507,24 @@ METHOD(pts_component_t, verify, status_t,
 	status_t status = NOT_FOUND;
 
 	this->aik_id = pts->get_aik_id(pts);
+
+
 	pcrs = pts->get_pcrs(pts);
 	if (!pcrs)
 	{
 		return FAILED;
 	}
+	pcr_algo = pcrs->get_pcr_algo(pcrs);
+
 	measurement = evidence->get_measurement(evidence, &pcr,	&algo, &transform,
 											&creation_time);
+	if (algo != pcr_algo)
+	{
+		DBG1(DBG_PTS, "received %N measurement hash but PCR bank is %N",
+			 pts_meas_algorithm_names, algo, pts_meas_algorithm_names, algo);
+		return FAILED;
+	}
+	this->pcr_padding = (transform == PTS_PCR_TRANSFORM_SHORT);
 
 	if (qualifier == (PTS_ITA_QUALIFIER_FLAG_KERNEL |
 					  PTS_ITA_QUALIFIER_TYPE_TRUSTED))
@@ -622,15 +604,16 @@ METHOD(pts_component_t, verify, status_t,
 								  "but is '%s'", ima_name);
 					return FAILED;
 				}
-				if (hash_algo != PTS_MEAS_ALGO_SHA1)
+				if (hash_algo != pcr_algo)
 				{
 					DBG1(DBG_PTS, "ima: boot_aggregate algorithm must be %N "
 								  "but is %N",
-								   pts_meas_algorithm_names, PTS_MEAS_ALGO_SHA1,
+								   pts_meas_algorithm_names, pcr_algo,
 								   pts_meas_algorithm_names, hash_algo);
 					return FAILED;
 				}
-				if (!check_boot_aggregate(pcrs, measurement, ima_algo))
+				if (!check_boot_aggregate(pcrs, measurement, ima_algo,
+										  this->pcr_padding))
 				{
 					return FAILED;
 				}
@@ -673,20 +656,33 @@ METHOD(pts_component_t, verify, status_t,
 				break;
 			case IMA_STATE_RUNTIME:
 			{
-				uint8_t hash_buf[HASH_SIZE_SHA512];
-				uint8_t digest_buf[HASH_SIZE_SHA512], *hex_digest_buf;
 				chunk_t hex_digest, digest, hash;
+				uint8_t digest_buf[HASH_SIZE_SHA512], *hex_digest_buf;
+				uint8_t hash_buf[HASH_SIZE_SHA512];
+				size_t hash_size;
+				pts_meas_algorithms_t meas_algo;
 				enumerator_t *e;
 
 				this->count++;
 				if (evidence->get_validation(evidence, NULL) !=
-					PTS_COMP_EVID_VALIDATION_PASSED)
+							PTS_COMP_EVID_VALIDATION_PASSED)
 				{
 					DBG1(DBG_PTS, "evidence validation failed");
 					this->count_failed++;
 					return FAILED;
 				}
-				hash = chunk_create(hash_buf, pts_meas_algo_hash_size(algo));
+				hash_size = pts_meas_algo_hash_size(algo);
+				hash = chunk_create(hash_buf, hash_size);
+
+				if (this->pcr_padding)
+				{
+					memset(hash_buf, 0x00, hash_size);
+					meas_algo = PTS_MEAS_ALGO_SHA1;
+				}
+				else
+				{
+					meas_algo = algo;
+				}
 
 				e = this->pts_db->create_file_meas_enumerator(this->pts_db,
 												pts->get_platform_id(pts),
@@ -697,8 +693,9 @@ METHOD(pts_component_t, verify, status_t,
 					{
 						hex_digest = chunk_from_str(hex_digest_buf);
 						digest = chunk_from_hex(hex_digest, digest_buf);
-						if (!ima_hash(digest, ima_algo, ima_name,
-									  FALSE, algo, hash_buf))
+
+						if (!pts_ima_event_hash(digest, ima_algo, ima_name,
+												meas_algo, hash_buf))
 						{
 							status = FAILED;
 							break;
@@ -916,6 +913,8 @@ pts_component_t *pts_ita_comp_ima_create(uint32_t depth,
 		.pts_db = pts_db,
 		.pcr_info = lib->settings->get_bool(lib->settings,
 						"%s.plugins.imc-attestation.pcr_info", FALSE, lib->ns),
+		.pcr_padding = lib->settings->get_bool(lib->settings,
+						"%s.plugins.imc-attestation.pcr_padding", TRUE, lib->ns),
 		.ref = 1,
 	);
 
